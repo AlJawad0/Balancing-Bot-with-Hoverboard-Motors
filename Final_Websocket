@@ -1,0 +1,411 @@
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <Wire.h>
+#include <BMI160Gen.h>
+#include <math.h>
+
+/******** TIMING & EXECUTION CONSTANTS ********/
+#define SAMPLE_TIME_400HZ 0.0025f // 400Hz = 2.5ms
+#define PID_TIME_100HZ    0.0100f // 100Hz = 10.0ms
+#define TARGET_ANGLE      0.0f
+
+/******** WIFI ********/
+const char* ssid = "ESP32_Robot";
+const char* password = "12345678";
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+/******** IMU SENSOR ********/
+#define SDA_PIN 25
+#define SCL_PIN 26
+#define IMU_ADDR 0x68
+
+#define ACC_SCALE 0.00006103515f
+#define GYRO_SCALE 0.00763358f
+
+/******** MOTOR PINS ********/
+const int pwmPinL = 27;
+const int dirPinL = 14;
+const int pwmPinR = 33;
+const int dirPinR = 32;
+
+/******** SHARED GLOBAL STATE (Volatile) ********/
+volatile float Kp = 10.0f, Ki = 40.0f, Kd = 0.05f;
+volatile int maxPWM = 80, minPWM = 5;
+
+volatile float currentAngle = 0.0f, prevAngle = 0.0f;
+volatile float error = 0.0f, pitchRate = 0.0f, errorSum = 0.0f;
+volatile float movementAngle = 0.0f, smoothTurnL = 0.0f, smoothTurnR = 0.0f;
+volatile float prevCompAngle = 0.0f;
+volatile float gyroBiasX = 0.0f, referenceAngle = 0.0f;
+
+volatile int pwmL = 0, pwmR = 0;
+volatile int dirL = 1, dirR = 0;
+
+volatile char command = 'S';           
+volatile uint32_t cmdTimeoutCounter = 0; // Replaces millis() for timing
+volatile bool requestCalibration = false;
+
+/******** HTML & JAVASCRIPT ********/
+String getHTML() {
+  return R"rawliteral(
+<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body { background:#0a0a0a; color:#0ff; font-family:sans-serif; text-align:center; }
+.grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; max-width:500px; margin:auto; }
+.card { background:#111; padding:15px; border-radius:10px; border:1px solid #222; }
+.full { grid-column:1/3; }
+.val { font-size:1.8em; color:white; }
+button { padding:12px; border:none; border-radius:8px; background:#ff4444; color:white; font-size:16px; }
+.slider { width:90%; }
+#startBtn { background:#44ff44; color:black; font-weight:bold; }
+</style>
+</head><body>
+
+<h2>Robot Dashboard</h2>
+
+<div class="grid">
+<div class="card"><div>Pitch</div><div id="pitch" class="val">0</div></div>
+<div class="card"><div>Diff</div><div id="diff" class="val">0</div></div>
+<div class="card"><div>Pitch Rate</div><div id="rate" class="val">0</div></div>
+<div class="card"><div>Error Sum</div><div id="sum" class="val">0</div></div>
+<div class="card"><div>PWM L</div><div id="pwmL" class="val">0</div></div>
+<div class="card"><div>PWM R</div><div id="pwmR" class="val">0</div></div>
+<div class="card"><div>Dir (L)</div><div id="dirL" class="val">S</div></div>
+<div class="card"><div>Dir (R)</div><div id="dirR" class="val">S</div></div>
+<div class="card full"><div>Command</div><div id="cmdDisp" class="val">S</div></div>
+<div class="card full"><div>Raw Pitch/Roll</div><div id="rawTilt" class="val">-</div></div>
+
+<div class="card full">
+<button id="startBtn" onclick="startTilt()">START PHONE CONTROL</button>
+</div>
+
+<div class="card full">
+Kp: <span id="kpv">10</span><br>
+<input type="range" min="0" max="50" step="0.1" value="10" class="slider" oninput="setPID()"><br><br>
+Kd: <span id="kdv">0.05</span><br>
+<input type="range" min="0" max="50" step="0.05" value="0.05" class="slider" oninput="setPID()"><br><br>
+Ki: <span id="kiv">40</span><br>
+<input type="range" min="0" max="100" step="0.05" value="40" class="slider" oninput="setPID()"><br><br>
+Max PWM: <span id="maxv">80</span><br>
+<input type="range" min="0" max="255" step="1" value="80" class="slider" oninput="setPID()"><br><br>
+Min PWM: <span id="minv">5</span><br>
+<input type="range" min="0" max="100" step="1" value="5" class="slider" oninput="setPID()">
+</div>
+
+<div class="card full">
+<button onclick="calibrate()">Calibrate</button>
+</div>
+
+</div>
+
+<script>
+let currentCmd = 'S';
+let tiltActive = false;
+
+// Async WebSocket Setup
+var gateway = `ws://${window.location.hostname}/ws`;
+var websocket;
+
+window.onload = () => {
+  websocket = new WebSocket(gateway);
+  websocket.onmessage = (e) => {
+    let d = JSON.parse(e.data);
+    document.getElementById('pitch').innerText = d.pitch;
+    document.getElementById('diff').innerText = d.diff;
+    document.getElementById('rate').innerText = d.rate;
+    document.getElementById('sum').innerText = d.sum;
+    document.getElementById('pwmL').innerText = d.pwmL;
+    document.getElementById('pwmR').innerText = d.pwmR;
+    document.getElementById('dirL').innerText = d.dirL;
+    document.getElementById('dirR').innerText = d.dirR;
+  };
+};
+
+function setPID(){
+  let s=document.querySelectorAll('.slider');
+  let kp=s[0].value, kd=s[1].value, ki=s[2].value, maxp=s[3].value, minp=s[4].value;
+
+  kpv.innerText=kp; kdv.innerText=kd; kiv.innerText=ki; maxv.innerText=maxp; minv.innerText=minp;
+  fetch(`/set?kp=${kp}&kd=${kd}&ki=${ki}&maxp=${maxp}&minp=${minp}`);
+}
+
+function calibrate(){
+  fetch('/calibrate');
+}
+
+async function startTilt() {
+  if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+    try {
+      const permission = await DeviceOrientationEvent.requestPermission();
+      if (permission === 'granted') enableTilt();
+      else alert('Permission denied.');
+    } catch (e) { alert('Error: ' + e); }
+  } else {
+    enableTilt();
+  }
+}
+
+function enableTilt() {
+  if (tiltActive) return;
+  tiltActive = true;
+  document.getElementById('startBtn').style.background = '#4444ff';
+  document.getElementById('startBtn').innerText = 'CONTROL ACTIVE';
+  
+  window.addEventListener('deviceorientation', (e) => {
+    let b = e.beta, g = e.gamma;
+    document.getElementById('rawTilt').innerText = 'P:' + (b?b.toFixed(0):'-') + ' R:' + (g?g.toFixed(0):'-');
+    
+    let newCmd = 'S';
+    if (b > 50) newCmd = 'B';
+    else if (b < -5) newCmd = 'F';
+    else if (g > 20) newCmd = 'R';
+    else if (g < -20) newCmd = 'L';
+    
+    if (newCmd !== currentCmd) {
+      currentCmd = newCmd;
+      document.getElementById('cmdDisp').innerText = currentCmd;
+      fetch(`/cmd?v=${currentCmd}`);
+    }
+  });
+}
+</script>
+</body></html>
+)rawliteral";
+}
+
+/******** WEBSOCKET EVENT HANDLER ********/
+void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
+  // Empty, strictly handled natively
+}
+
+/******** WEBSOCKET TELEMETRY (Called from Core 1) ********/
+void broadcastTelemetry() {
+  if (ws.count() > 0) {
+    char json[200];
+    snprintf(json, sizeof(json), 
+      "{\"pitch\":\"%.2f\",\"diff\":\"%.2f\",\"rate\":\"%.2f\",\"sum\":\"%.2f\",\"pwmL\":%d,\"pwmR\":%d,\"dirL\":%d,\"dirR\":%d}", 
+      currentAngle, error, pitchRate, errorSum, pwmL, pwmR, dirL, dirR);
+    ws.textAll(json);
+  }
+}
+
+/******** TASK SAFE CALIBRATION ********/
+// Runs safely inside control task using FreeRTOS Delays 
+// Prevents watchdog panics on Core 1
+void calibRoutineTaskSafe() {
+  int gx, gy, gz;
+  long sumX = 0;
+  for(int i = 0; i < 500; i++){
+    BMI160.readGyro(gx, gy, gz);
+    sumX += gx;
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+  gyroBiasX = (sumX / 500.0f) * GYRO_SCALE;
+
+  long sumY = 0, sumZ = 0;
+  int ax, ay, az;
+  for(int i = 0; i < 200; i++){
+    BMI160.readAccelerometer(ax, ay, az);
+    sumY += ay;
+    sumZ += az;
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+  float avgY = sumY / 200.0f;
+  float avgZ = sumZ / 200.0f;
+  referenceAngle = atan2(avgY, avgZ) * RAD_TO_DEG;
+
+  prevAngle = 0;
+  currentAngle = 0;
+  prevCompAngle = 0;
+  errorSum = 0;
+}
+
+/******** ASYNC NETWORK SETUP ********/
+void setupWiFi() {
+  WiFi.softAP(ssid, password);
+
+  ws.onEvent(onWsEvent);
+  server.addHandler(&ws);
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "text/html", getHTML());
+  });
+
+  server.on("/set", HTTP_GET, [](AsyncWebServerRequest *request){
+    if(request->hasParam("kp")) Kp = request->getParam("kp")->value().toFloat();
+    if(request->hasParam("kd")) Kd = request->getParam("kd")->value().toFloat();
+    if(request->hasParam("ki")) Ki = request->getParam("ki")->value().toFloat();
+    if(request->hasParam("maxp")) maxPWM = request->getParam("maxp")->value().toInt();
+    if(request->hasParam("minp")) minPWM = request->getParam("minp")->value().toInt();
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/cmd", HTTP_GET, [](AsyncWebServerRequest *request){
+    if(request->hasParam("v")){
+      command = request->getParam("v")->value().charAt(0);
+      cmdTimeoutCounter = 0; // Reset tick-based timeout counter
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/calibrate", HTTP_GET, [](AsyncWebServerRequest *request){
+    requestCalibration = true; // Signal Core 1 to recalibrate safely
+    request->send(200, "text/plain", "Calibrating... KEEP STILL");
+  });
+
+  server.begin();
+}
+
+/******** THE CORE CONTROL TASK (Runs on Core 1) ********/
+void controlTask(void *pvParameters) {
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const TickType_t xFrequency = pdMS_TO_TICKS(2.5); // Fixed 400Hz clock
+  int cycleCounter = 0;
+  int wsCounter = 0;
+
+  while(1) {
+    // 1. Wait for deterministic 2.5ms tick
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+
+    // Dynamic Runtime Calibration Execution
+    if (requestCalibration) {
+      analogWrite(pwmPinL, 0);
+      analogWrite(pwmPinR, 0);
+      calibRoutineTaskSafe();
+      requestCalibration = false;
+      xLastWakeTime = xTaskGetTickCount(); // Synchronize schedule post-calib
+      continue;
+    }
+
+    // 2. FAST SENSOR READ (400Hz)
+    int ax, ay, az, gx, gy, gz;
+    BMI160.readMotionSensor(ax, ay, az, gx, gy, gz);
+    
+    // 3. COMPLEMENTARY FILTER (400Hz)
+    float accAngleRaw = atan2(ay, az) * RAD_TO_DEG;
+    float gyroRate = (gx * GYRO_SCALE) - gyroBiasX;
+    
+    float gyroAngle = gyroRate * SAMPLE_TIME_400HZ;
+    float rawAngle = 0.9934f * (prevAngle + gyroAngle) + 0.0066f * accAngleRaw;
+    
+    currentAngle = rawAngle - referenceAngle;
+    prevAngle = rawAngle;
+
+    // 4. DECIMATED PID CONTROL (100Hz - Every 4th Cycle)
+    cycleCounter++;
+    if (cycleCounter >= 4) {
+      cycleCounter = 0;
+
+      // Tick-based Command Timeout (1000ms = 100 cycles at 100Hz)
+      cmdTimeoutCounter++;
+      if (cmdTimeoutCounter > 100) {
+        command = 'S';
+      }
+
+      // Target Kinematics
+      float targetTilt = 0;
+      float targetTurnL = 0;
+      float targetTurnR = 0;
+
+      if (command == 'F') { targetTilt = -1.5; } 
+      else if (command == 'B') { targetTilt = 1.5; }
+      else if (command == 'L') { targetTurnR = 25.0; }
+      else if (command == 'R') { targetTurnL = 25.0; }
+
+      // Smoothing Low-Pass
+      movementAngle = (movementAngle * 0.95f) + (targetTilt * 0.05f);
+      smoothTurnL = (smoothTurnL * 0.90f) + (targetTurnL * 0.10f);
+      smoothTurnR = (smoothTurnR * 0.90f) + (targetTurnR * 0.10f);
+
+      // PID Math
+      error = currentAngle - (TARGET_ANGLE + movementAngle);
+      pitchRate = (currentAngle - prevCompAngle) / PID_TIME_100HZ; 
+
+      if (command == 'S') {
+         errorSum += error;
+         errorSum = constrain(errorSum, -300, 300);
+      }
+
+      int motorPowerRaw = (Kp * error) + (Ki * errorSum * PID_TIME_100HZ) + (Kd * pitchRate); 
+      prevCompAngle = currentAngle; 
+
+      // 5. MOTOR EXECUTION & HARDWARE PWM
+      if (fabs(currentAngle) < 25.0f) { 
+        int mpL = motorPowerRaw + smoothTurnL;
+        int mpR = motorPowerRaw + smoothTurnR;
+
+        // Left Motor
+        if (mpL > 0) { dirL = 1; pwmL = mpL + minPWM; } 
+        else { dirL = 0; pwmL = -mpL + minPWM; }
+        pwmL = constrain(pwmL, 0, maxPWM);   
+
+        // Right Motor
+        if (mpR > 0) { dirR = 0; pwmR = mpR + minPWM; } 
+        else { dirR = 1; pwmR = -mpR + minPWM; }
+        pwmR = constrain(pwmR, 0, maxPWM);
+
+      } else {
+        pwmL = 0;
+        pwmR = 0;
+        errorSum = 0; // Reset windup
+      }
+
+      digitalWrite(dirPinL, dirL);
+      digitalWrite(dirPinR, dirR);
+      analogWrite(pwmPinL, pwmL);
+      analogWrite(pwmPinR, pwmR);
+
+      // 6. STREAM TELEMETRY (20Hz broadcast to not flood WiFi stack)
+      wsCounter++;
+      if(wsCounter >= 5) {
+         wsCounter = 0;
+         broadcastTelemetry();
+
+         // Format for Serial Plotter: Angle, Target, and Motor Power
+         Serial.print(currentAngle); 
+         Serial.print(",");
+         Serial.print(movementAngle); // Your shifting target
+         Serial.print(",");
+         Serial.println(pwmL);
+         Serial.print(",");
+         Serial.println(command);
+      }
+    }
+  }
+}
+
+/******** INITIALIZATION ********/
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(pwmPinL, OUTPUT);
+  pinMode(dirPinL, OUTPUT);
+  pinMode(pwmPinR, OUTPUT);
+  pinMode(dirPinR, OUTPUT);
+
+  // Forced hardware constraint: 400KHz I2C
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000); 
+  
+  BMI160.begin(BMI160GenClass::I2C_MODE, IMU_ADDR);
+
+  // Initial Boot Calibration
+  calibRoutineTaskSafe();
+  
+  // Set up Networking (Hooks natively onto Core 0 via AsyncWebServer)
+  setupWiFi();
+
+  // Spin up strict deterministic Task onto Core 1
+  xTaskCreatePinnedToCore(controlTask, "CTRL", 4096, NULL, 3, NULL, 1);
+}
+
+/******** MAIN THREAD (Core 0) ********/
+void loop() {
+  // Empty loop architecture. FreeRTOS Tasks handle execution.
+  // We only run native socket cleanup here on Core 0.
+  ws.cleanupClients();
+  vTaskDelay(pdMS_TO_TICKS(100)); 
+}
